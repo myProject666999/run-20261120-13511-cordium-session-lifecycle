@@ -1,0 +1,912 @@
+/*
+ * Copyright Octelium Labs, LLC. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package controller
+
+import (
+	"context"
+	"fmt"
+
+	v1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
+	workspacecommon "github.com/octelium/cordium/cluster/common"
+	"github.com/octelium/cordium/cluster/common/components"
+	"github.com/octelium/cordium/cluster/common/ovutils"
+	"github.com/octelium/cordium/pkg/apiutils/ucordiumv1"
+	"github.com/octelium/octelium/apis/cluster/ccordiumv1"
+	"github.com/octelium/octelium/apis/main/cordiumv1"
+	"github.com/octelium/octelium/apis/rsc/rmetav1"
+	"github.com/octelium/octelium/cluster/common/k8sutils"
+	"github.com/octelium/octelium/pkg/common/pbutils"
+	"github.com/octelium/octelium/pkg/utils/ldflags"
+	utils_types "github.com/octelium/octelium/pkg/utils/types"
+	"github.com/pkg/errors"
+	"go.uber.org/zap"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes"
+)
+
+const ns = workspacecommon.K8sNS
+
+const volumeSnapshotAPIGroup = "snapshot.storage.k8s.io"
+
+func (c *Controller) doOnAdd(ctx context.Context, ws *cordiumv1.Workspace) error {
+
+	zap.S().Debugf("Creating Workspace deployment for: %s", ws.Metadata.Name)
+
+	volumeMounts, err := c.resolveVolumeMounts(ctx, ws)
+	if err != nil {
+		return err
+	}
+
+	if err := c.k8sC.CoreV1().ConfigMaps(ns).Delete(ctx, getK8sRscName(ws), metav1.DeleteOptions{}); err != nil {
+		if !k8serr.IsNotFound(err) {
+			return err
+		}
+	}
+
+	ownerCM, err := c.k8sC.CoreV1().ConfigMaps(ns).Create(ctx, c.getOwnerConfigMap(ws), metav1.CreateOptions{})
+	if err != nil {
+		return err
+	}
+
+	if _, err := c.k8sC.AppsV1().
+		Deployments(ns).
+		Create(ctx, c.newDeployment(ws, ownerCM, volumeMounts), metav1.CreateOptions{}); err != nil {
+		return err
+	}
+
+	if err := c.createK8sService(ctx, ws, ownerCM); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func getResourceQuantity(arg string) *resource.Quantity {
+	ret := resource.MustParse(arg)
+	return &ret
+}
+
+func (c *Controller) newPodSpec(ws *cordiumv1.Workspace,
+	volumeMounts []*ccordiumv1.ResolvedVolumeMount) corev1.PodSpec {
+
+	storageLimit := func() int64 {
+
+		return 250 * 1000
+	}()
+
+	return corev1.PodSpec{
+		NodeSelector: func() map[string]string {
+			return map[string]string{
+				"octelium.com/node-mode-cordium": "",
+			}
+		}(),
+
+		AutomountServiceAccountToken: utils_types.BoolToPtr(false),
+		EnableServiceLinks:           utils_types.BoolToPtr(false),
+
+		SecurityContext: &corev1.PodSecurityContext{
+			Sysctls: []corev1.Sysctl{
+				{
+					Name:  "net.ipv4.ip_unprivileged_port_start",
+					Value: "1",
+				},
+				{
+					Name:  "net.ipv4.ping_group_range",
+					Value: "0 2147483647",
+				},
+				{
+					Name:  "net.ipv4.tcp_syncookies",
+					Value: "1",
+				},
+			},
+		},
+
+		Hostname:                      "octelium",
+		TerminationGracePeriodSeconds: utils_types.Int64ToPtr(120),
+		Volumes: func() []corev1.Volume {
+			ret := []corev1.Volume{
+
+				{
+					Name: "octelium",
+					VolumeSource: corev1.VolumeSource{
+
+						/*
+							EmptyDir: &corev1.EmptyDirVolumeSource{
+								SizeLimit: getResourceQuantity(fmt.Sprintf("%dMi", int64(float64(storageLimit)*1.5))),
+							},
+						*/
+
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: c.getPVCName(ws),
+						},
+					},
+				},
+
+				{
+					Name: "var-tmp",
+					VolumeSource: corev1.VolumeSource{
+						EmptyDir: &corev1.EmptyDirVolumeSource{
+							SizeLimit: getResourceQuantity(fmt.Sprintf("%dMi", int64(float64(storageLimit)*1.5))),
+						},
+					},
+				},
+
+				{
+					Name: "octelium-root",
+					VolumeSource: corev1.VolumeSource{
+						EmptyDir: &corev1.EmptyDirVolumeSource{
+							SizeLimit: getResourceQuantity("1000Mi"),
+						},
+					},
+				},
+			}
+
+			for _, mount := range volumeMounts {
+				ret = append(ret, corev1.Volume{
+					Name: getK8sVolumeName(mount),
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: getVolumePVCNameByUID(mount.VolumeRef.Uid),
+							ReadOnly:  mount.ReadOnly,
+						},
+					},
+				})
+			}
+
+			return ret
+		}(),
+
+		// RestartPolicyNever does not work
+		// RestartPolicy: corev1.RestartPolicyNever,
+
+		Containers: []corev1.Container{
+			{
+				Name:            "workspace",
+				Image:           components.GetImage(components.Supervisor, ""),
+				ImagePullPolicy: k8sutils.GetImagePullPolicy(),
+				Env: func() []corev1.EnvVar {
+					var ret []corev1.EnvVar
+
+					ret = append(ret, corev1.EnvVar{
+						Name:  "OCTELIUM_WS_NAME",
+						Value: ws.Metadata.Name,
+					})
+
+					ret = append(ret, corev1.EnvVar{
+						Name:  "OCTELIUM_WS_UID",
+						Value: ws.Metadata.Uid,
+					})
+
+					/*
+						if ldflags.IsDev() {
+							ret = append(ret, corev1.EnvVar{
+								Name:  "GRPC_GO_LOG_VERBOSITY_LEVEL",
+								Value: "99",
+							})
+
+							ret = append(ret, corev1.EnvVar{
+								Name:  "GRPC_GO_LOG_SEVERITY_LEVEL",
+								Value: "info",
+							})
+						}
+					*/
+
+					return ret
+				}(),
+
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceMemory: resource.MustParse("5Mi"),
+						corev1.ResourceCPU:    resource.MustParse("10m"),
+						// corev1.ResourceEphemeralStorage: resource.MustParse("50Mi"),
+					},
+					Limits: corev1.ResourceList{
+						corev1.ResourceMemory: resource.MustParse(
+							fmt.Sprintf("%dMi", func() uint32 {
+								if ws.Status.Limit == nil || ws.Status.Limit.Memory == nil ||
+									ws.Status.Limit.Memory.Megabytes == 0 {
+									return 512
+								}
+								return ws.Status.Limit.Memory.Megabytes
+							}())),
+						corev1.ResourceCPU: resource.MustParse(
+							fmt.Sprintf("%dm", func() uint32 {
+								if ws.Status.Limit == nil || ws.Status.Limit.Cpu == nil ||
+									ws.Status.Limit.Cpu.Millicores == 0 {
+									return 500
+								}
+
+								return ws.Status.Limit.Cpu.Millicores
+							}())),
+
+						/*
+							corev1.ResourceEphemeralStorage: resource.MustParse(
+								fmt.Sprintf("%dMi", func() int64 {
+									if ws.Status.Limit == nil || ws.Status.Limit.Storage == nil ||
+										ws.Status.Limit.Storage.Megabytes == 0 {
+										return 1000
+									}
+									return ws.Status.Limit.Storage.Megabytes
+								}())),
+						*/
+					},
+				},
+
+				SecurityContext: &corev1.SecurityContext{
+					Privileged:             utils_types.BoolToPtr(true),
+					ReadOnlyRootFilesystem: utils_types.BoolToPtr(false),
+
+					RunAsUser:  utils_types.Int64ToPtr(0),
+					RunAsGroup: utils_types.Int64ToPtr(0),
+
+					Capabilities: &corev1.Capabilities{
+						/*
+							Drop: []corev1.Capability{
+								"ALL",
+							},
+						*/
+
+						/*
+							Add: []corev1.Capability{
+								"NET_BIND_SERVICE",
+								"NET_RAW",
+								"NET_ADMIN",
+
+								"SYS_ADMIN",
+
+								"MKNOD",
+								"SYS_CHROOT",
+								"SETFCAP",
+
+								"SETUID",
+								"SETGID",
+
+								"CHOWN",
+								"FOWNER",
+								"KILL",
+								"DAC_OVERRIDE",
+								"FSETID",
+								"DAC_READ_SEARCH",
+							},
+						*/
+
+						/*
+							Add: []corev1.Capability{
+								"NET_BIND_SERVICE",
+								"NET_RAW",
+								"NET_ADMIN",
+
+								"KILL",
+
+								"MKNOD",
+
+								"SYS_ADMIN",
+
+								"SETUID",
+								"SETGID",
+								"FSETID",
+								"SYS_CHROOT",
+
+								"SETPCAP",
+								"SETFCAP",
+
+								"DAC_OVERRIDE",
+								"AUDIT_WRITE",
+								"CHOWN",
+								"FOWNER",
+							},
+						*/
+					},
+				},
+
+				VolumeMounts: func() []corev1.VolumeMount {
+					ret := []corev1.VolumeMount{
+
+						/*
+							{
+								Name:      "varcroot",
+								MountPath: "/var/lib/containers",
+							},
+						*/
+
+						/*
+							{
+								Name:      "varcusr",
+								MountPath: "/home/octelium/.local/share/containers",
+							},
+						*/
+
+						{
+							Name:      "octelium",
+							MountPath: "/octelium",
+						},
+
+						{
+							Name:      "octelium-root",
+							MountPath: "/octelium-root",
+						},
+
+						{
+							Name:      "var-tmp",
+							MountPath: "/var/tmp",
+						},
+
+						/*
+							{
+								Name:      "dind",
+								MountPath: "/octelium-dind",
+							},
+						*/
+					}
+
+					for _, mount := range volumeMounts {
+						ret = append(ret, corev1.VolumeMount{
+							Name:      getK8sVolumeName(mount),
+							MountPath: getK8sVolumeMountPath(mount),
+							ReadOnly:  mount.ReadOnly,
+						})
+					}
+
+					return ret
+				}(),
+			},
+		},
+	}
+}
+
+func (c *Controller) newDeployment(ws *cordiumv1.Workspace, ownerCM *corev1.ConfigMap,
+	volumeMounts []*ccordiumv1.ResolvedVolumeMount) *appsv1.Deployment {
+
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      getK8sRscName(ws),
+			Namespace: ns,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(ownerCM, corev1.SchemeGroupVersion.WithKind("ConfigMap")),
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Strategy: appsv1.DeploymentStrategy{
+				Type: appsv1.RecreateDeploymentStrategyType,
+			},
+			Selector: &metav1.LabelSelector{
+				MatchLabels: getLabels(ws),
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      getLabels(ws),
+					Annotations: c.getAnnotations(ws),
+				},
+				Spec: c.newPodSpec(ws, volumeMounts),
+			},
+		},
+	}
+}
+
+func (c *Controller) getAnnotations(ws *cordiumv1.Workspace) map[string]string {
+	return map[string]string{
+		"cluster-autoscaler.kubernetes.io/safe-to-evict":           "false",
+		"container.apparmor.security.beta.kubernetes.io/workspace": "unconfined",
+	}
+}
+
+func (c *Controller) createK8sService(ctx context.Context,
+	ws *cordiumv1.Workspace, ownerCM *corev1.ConfigMap) error {
+	svcK8s := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      getK8sRscName(ws),
+			Namespace: ns,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(ownerCM, corev1.SchemeGroupVersion.WithKind("ConfigMap")),
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Type:     corev1.ServiceTypeClusterIP,
+			Selector: getLabels(ws),
+			Ports: func() []corev1.ServicePort {
+
+				ret := []corev1.ServicePort{
+					{
+						Name:     "grpc",
+						Protocol: corev1.ProtocolTCP,
+						Port:     8080,
+						TargetPort: intstr.IntOrString{
+							Type:   intstr.Int,
+							IntVal: 8080,
+						},
+					},
+					{
+						Name:     "essh",
+						Protocol: corev1.ProtocolTCP,
+						Port:     2022,
+						TargetPort: intstr.IntOrString{
+							Type:   intstr.Int,
+							IntVal: 2022,
+						},
+					},
+					{
+						Name:     "tunnel",
+						Protocol: corev1.ProtocolUDP,
+						Port:     int32(workspacecommon.GetWorkspaceTunnelPort()),
+						TargetPort: intstr.IntOrString{
+							Type:   intstr.Int,
+							IntVal: int32(workspacecommon.GetWorkspaceTunnelPort()),
+						},
+					},
+				}
+
+				return ret
+			}(),
+		},
+	}
+
+	if _, err := c.k8sC.CoreV1().Services(ns).Create(ctx, svcK8s, metav1.CreateOptions{}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *Controller) getOwnerConfigMap(ws *cordiumv1.Workspace) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      getK8sRscName(ws),
+			Namespace: ns,
+		},
+		Data: map[string]string{
+			"uid": ws.Metadata.Uid,
+		},
+	}
+}
+
+func getK8sRscName(ws *cordiumv1.Workspace) string {
+	return fmt.Sprintf("ws-%s", ws.Metadata.Name)
+}
+
+func getLabels(ws *cordiumv1.Workspace) map[string]string {
+	return map[string]string{
+		"app":                         "octelium",
+		"octelium.com/component-type": "user",
+		"octelium.com/component":      "workspace",
+		"octelium.com/workspace-uid":  ws.Metadata.Uid,
+	}
+}
+
+func (c *Controller) doOnDeleteK8s(ctx context.Context, ws *cordiumv1.Workspace) error {
+	zap.S().Debugf("Deleting k8s resources of Workspace: %s", ws.Metadata.Name)
+	if err := c.k8sC.CoreV1().ConfigMaps(ns).Delete(ctx, getK8sRscName(ws), metav1.DeleteOptions{}); err != nil {
+		if k8serr.IsNotFound(err) {
+			zap.S().Debugf("Owner configmap of Workspace is already deleted. Nothing to be done: %s",
+				ws.Metadata.Name)
+			return nil
+		}
+		return err
+	}
+
+	return nil
+}
+
+func DoDeleteWorkspaceOwner(ctx context.Context, ws *cordiumv1.Workspace, k8sC kubernetes.Interface) error {
+
+	zap.S().Debugf("Deleting owner configmap of Workspace: %s", ws.Metadata.Name)
+
+	if ldflags.IsDev() {
+		podList, err := k8sC.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("octelium.com/workspace-uid=%s", ws.Metadata.Uid),
+		})
+		if err == nil {
+			zap.L().Debug("To be deleted podList", zap.Any("podList", podList))
+			if len(podList.Items) == 1 {
+				zap.L().Debug("Workspace pod to be deleted", zap.Any("pod", podList.Items[0]))
+			}
+		}
+	}
+
+	if err := k8sC.CoreV1().ConfigMaps(ns).Delete(ctx, getK8sRscName(ws), metav1.DeleteOptions{}); err != nil {
+		if k8serr.IsNotFound(err) {
+			zap.S().Debugf("Owner configmap of Workspace is already deleted. Nothing to be done: %s", ws.Metadata.Name)
+			return nil
+		}
+		return err
+	}
+
+	return nil
+}
+
+func (c *Controller) setPersistentVolumeClaim(ctx context.Context, ws *cordiumv1.Workspace) error {
+
+	dataSource, err := c.getPVCDataSource(ctx, ws)
+	if err != nil {
+		return err
+	}
+
+	storageBytes := c.getPVCStorageBytes(ctx, ws, dataSource)
+
+	storageReq := resource.NewQuantity(storageBytes, resource.DecimalSI)
+
+	zap.L().Debug("Setting PVC", zap.String("name", ws.Metadata.Name), zap.Int64("sizeBytes", storageBytes))
+
+	if _, err := c.k8sC.CoreV1().PersistentVolumeClaims(ns).Create(ctx, &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      c.getPVCName(ws),
+			Namespace: ns,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					"storage": *storageReq,
+				},
+			},
+			AccessModes: []corev1.PersistentVolumeAccessMode{
+				corev1.ReadWriteOnce,
+			},
+			StorageClassName: func() *string {
+				if val := c.getStorageClassName(ctx, ws); val != "" {
+					return utils_types.StrToPtr(val)
+				}
+				return nil
+			}(),
+			DataSource: dataSource,
+		},
+	}, metav1.CreateOptions{}); err != nil {
+		if !k8serr.IsAlreadyExists(err) {
+			return err
+		} else {
+			zap.L().Debug("No need to recreate Workspace PVC. Already exists...",
+				zap.String("wsName", ws.Metadata.Name))
+		}
+	}
+
+	return nil
+}
+
+func getPVCStorageMegabytes(ws *cordiumv1.Workspace) int64 {
+	if ws.Status.Limit != nil && ws.Status.Limit.Storage != nil &&
+		ws.Status.Limit.Storage.Megabytes > 0 &&
+		ws.Status.Limit.Storage.Megabytes < 5000000 {
+		return int64(ws.Status.Limit.Storage.Megabytes)
+	}
+
+	if ldflags.IsDev() {
+		return 50 * 1000
+	}
+
+	return 10 * 1000
+}
+
+func (c *Controller) getPVCStorageBytes(ctx context.Context,
+	ws *cordiumv1.Workspace, dataSource *corev1.TypedLocalObjectReference) int64 {
+
+	ret := getPVCStorageMegabytes(ws) * 1000 * 1000
+
+	if restoreSize := c.getPVCRestoreSizeBytes(ctx, ws, dataSource); restoreSize > ret {
+		zap.L().Debug("Using the restore size of the snapshot as the PVC size",
+			zap.String("wsName", ws.Metadata.Name), zap.Int64("sizeBytes", restoreSize))
+		return restoreSize
+	}
+
+	return ret
+}
+
+func (c *Controller) getPVCRestoreSizeBytes(ctx context.Context,
+	ws *cordiumv1.Workspace, dataSource *corev1.TypedLocalObjectReference) int64 {
+
+	if dataSource == nil {
+		return 0
+	}
+
+	var ret int64
+
+	k8sSnapshot, err := c.snapshotC.SnapshotV1().VolumeSnapshots(ns).
+		Get(ctx, dataSource.Name, metav1.GetOptions{})
+	if err == nil && k8sSnapshot.Status != nil && k8sSnapshot.Status.RestoreSize != nil {
+		ret = k8sSnapshot.Status.RestoreSize.Value()
+	}
+
+	if ws.Status.WorkspaceSnapshotRef == nil {
+		return ret
+	}
+
+	snapshot, err := c.octeliumC.CordiumC().GetWorkspaceSnapshot(ctx, &rmetav1.GetOptions{
+		Uid: ws.Status.WorkspaceSnapshotRef.Uid,
+	})
+	if err != nil {
+		return ret
+	}
+
+	return max(ret, int64(snapshot.Status.RestoreSizeBytes))
+}
+
+func (c *Controller) getPVCDataSource(ctx context.Context,
+	ws *cordiumv1.Workspace) (*corev1.TypedLocalObjectReference, error) {
+
+	if ws.Status.IsBuild {
+		return nil, nil
+	}
+
+	if !ws.Spec.IsEphemeral && ws.Status.SuccessfulRuns > 0 {
+		return nil, nil
+	}
+
+	if ws.Status.WorkspaceSnapshotRef != nil {
+		snapshot, err := c.octeliumC.CordiumC().GetWorkspaceSnapshot(ctx, &rmetav1.GetOptions{
+			Uid: ws.Status.WorkspaceSnapshotRef.Uid,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		if !ucordiumv1.ToWorkspaceSnapshot(snapshot).IsReady() {
+			return nil, errors.Errorf("The WorkspaceSnapshot: %s is not ready to be restored from",
+				snapshot.Metadata.Name)
+		}
+
+		k8sSnapshot, err := c.snapshotC.SnapshotV1().VolumeSnapshots(ns).
+			Get(ctx, getWorkspaceSnapshotK8sName(snapshot), metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+
+		if !isVolumeSnapshotReady(k8sSnapshot) {
+			return nil, errors.Errorf("The volume snapshot of the WorkspaceSnapshot: %s is not readyToUse",
+				snapshot.Metadata.Name)
+		}
+
+		return getVolumeSnapshotDataSource(k8sSnapshot.Name), nil
+	}
+
+	if ws.Status.TemplateRef == nil {
+		return nil, nil
+	}
+
+	tmpl, err := c.octeliumC.CordiumC().GetTemplate(ctx, &rmetav1.GetOptions{
+		Uid: ws.Status.TemplateRef.Uid,
+	})
+	if err != nil {
+		return nil, nil
+	}
+
+	if !ucordiumv1.ToTemplate(tmpl).HasReadyBuild() {
+		return nil, nil
+	}
+
+	k8sSnapshot, err := c.snapshotC.SnapshotV1().
+		VolumeSnapshots(ns).
+		Get(ctx, c.getTemplateBuildName(tmpl), metav1.GetOptions{})
+	if err != nil {
+		zap.L().Debug("Could not get the template snapshot",
+			zap.Any("ws", ws), zap.Any("tmpl", tmpl), zap.Error(err))
+		return nil, nil
+	}
+
+	if !isVolumeSnapshotReady(k8sSnapshot) {
+		zap.L().Debug("The template snapshot is not readyToUse yet",
+			zap.String("wsName", ws.Metadata.Name), zap.String("tmplName", tmpl.Metadata.Name))
+		return nil, nil
+	}
+
+	return getVolumeSnapshotDataSource(k8sSnapshot.Name), nil
+}
+
+func getVolumeSnapshotDataSource(name string) *corev1.TypedLocalObjectReference {
+	return &corev1.TypedLocalObjectReference{
+		APIGroup: utils_types.StrToPtr(volumeSnapshotAPIGroup),
+		Kind:     "VolumeSnapshot",
+		Name:     name,
+	}
+}
+
+func (c *Controller) getPVCName(ws *cordiumv1.Workspace) string {
+	return getPVCNameByWorkspaceUID(ws.Metadata.Uid)
+}
+
+func getPVCNameByWorkspaceUID(uid string) string {
+	return fmt.Sprintf("ws-%s", uid)
+}
+
+func (c *Controller) getTemplateBuildName(tmpl *cordiumv1.Template) string {
+	return fmt.Sprintf("%s-%s",
+		tmpl.Metadata.Uid,
+		tmpl.Status.BuildInfo.CurrentReadyBuildID)
+}
+
+func (c *Controller) getStorageClassName(ctx context.Context, ws *cordiumv1.Workspace) string {
+
+	cc, err := c.octeliumC.CordiumV1Utils().GetClusterConfig(ctx)
+	if err != nil {
+		return ""
+	}
+
+	if cc.Spec.Workspace != nil && cc.Spec.Workspace.Storage != nil &&
+		cc.Spec.Workspace.Storage.StorageClass != nil &&
+		len(cc.Spec.Workspace.Storage.StorageClass.Rules) > 0 {
+
+		for _, rule := range cc.Spec.Workspace.Storage.StorageClass.Rules {
+			if rule.StorageClass == "" {
+				continue
+			}
+
+			inputMap := map[string]any{
+				"workspace": pbutils.MustConvertToMap(ws),
+			}
+
+			cond, err := ovutils.ToCoreCondition(rule.Condition)
+			if err != nil {
+				continue
+			}
+
+			match, err := c.celEngine.EvalCondition(ctx, cond, inputMap)
+			if err != nil {
+				continue
+			}
+			if match {
+				return rule.StorageClass
+			}
+		}
+	}
+
+	return ""
+}
+
+func (c *Controller) createTemplateSnapshot(ctx context.Context,
+	ws *cordiumv1.Workspace, tmpl *cordiumv1.Template) error {
+	if ldflags.IsTest() {
+		return nil
+	}
+
+	if !ucordiumv1.ToTemplate(tmpl).HasReadyBuild() {
+		return nil
+	}
+
+	zap.L().Debug("Creating template volume snapshot", zap.Any("tmpl", tmpl))
+
+	_, err := c.createVolumeSnapshot(ctx, &createVolumeSnapshotReq{
+		name:    c.getTemplateBuildName(tmpl),
+		pvcName: c.getPVCName(ws),
+		labels: map[string]string{
+			"octelium.com/template-uid":  tmpl.Metadata.Uid,
+			"octelium.com/parent-ws-uid": ws.Metadata.Uid,
+		},
+		workspace: ws,
+		template:  tmpl,
+	})
+
+	return err
+}
+
+type createVolumeSnapshotReq struct {
+	name      string
+	pvcName   string
+	labels    map[string]string
+	workspace *cordiumv1.Workspace
+	template  *cordiumv1.Template
+}
+
+func (c *Controller) createVolumeSnapshot(ctx context.Context,
+	req *createVolumeSnapshotReq) (*v1.VolumeSnapshot, error) {
+
+	snapshotClassName, err := c.getVolumeSnapshotClassName(ctx, req.workspace, req.template)
+	if err != nil {
+		return nil, err
+	}
+
+	snapshot := &v1.VolumeSnapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      req.name,
+			Namespace: ns,
+			Labels:    req.labels,
+		},
+		Spec: v1.VolumeSnapshotSpec{
+			VolumeSnapshotClassName: snapshotClassName,
+			Source: v1.VolumeSnapshotSource{
+				PersistentVolumeClaimName: utils_types.StrToPtr(req.pvcName),
+			},
+		},
+	}
+
+	ret, err := c.snapshotC.SnapshotV1().VolumeSnapshots(ns).Create(ctx, snapshot, metav1.CreateOptions{})
+	if err != nil {
+		switch {
+		case k8serr.IsAlreadyExists(err):
+			zap.L().Debug("The volume snapshot already exists",
+				zap.String("name", req.name))
+			return c.snapshotC.SnapshotV1().VolumeSnapshots(ns).
+				Get(ctx, req.name, metav1.GetOptions{})
+		default:
+			return nil, err
+		}
+	}
+
+	zap.L().Debug("Volume snapshot successfully created", zap.Any("snapshot", ret))
+
+	return ret, nil
+}
+
+func (c *Controller) getVolumeSnapshotClassName(ctx context.Context,
+	ws *cordiumv1.Workspace, tmpl *cordiumv1.Template) (*string, error) {
+
+	cc, err := c.octeliumC.CordiumV1Utils().GetClusterConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if cc.Spec.Workspace == nil || cc.Spec.Workspace.Storage == nil ||
+		cc.Spec.Workspace.Storage.VolumeSnapshotClass == nil ||
+		len(cc.Spec.Workspace.Storage.VolumeSnapshotClass.Rules) == 0 {
+		return nil, nil
+	}
+
+	ctxMap := make(map[string]any)
+	if ws != nil {
+		ctxMap["workspace"] = pbutils.MustConvertToMap(ws)
+	}
+	if tmpl != nil {
+		ctxMap["template"] = pbutils.MustConvertToMap(tmpl)
+	}
+
+	reqCtxMap := map[string]any{
+		"ctx": ctxMap,
+	}
+
+	for _, rule := range cc.Spec.Workspace.Storage.VolumeSnapshotClass.Rules {
+		if rule.VolumeSnapshotClass == "" {
+			continue
+		}
+
+		cond, err := ovutils.ToCoreCondition(rule.Condition)
+		if err != nil {
+			return nil, errors.Errorf(
+				"Could not read the volumeSnapshotClass rules of the Cluster: %+v", err)
+		}
+
+		isMatched, err := c.celEngine.EvalCondition(ctx, cond, reqCtxMap)
+		if err != nil {
+			return nil, errors.Errorf(
+				"Could not evaluate the volumeSnapshotClass rules of the Cluster: %+v", err)
+		}
+
+		if isMatched {
+			return utils_types.StrToPtr(rule.VolumeSnapshotClass), nil
+		}
+	}
+
+	return nil, nil
+}
+
+func isVolumeSnapshotReady(snapshot *v1.VolumeSnapshot) bool {
+	return snapshot != nil && snapshot.Status != nil &&
+		snapshot.Status.ReadyToUse != nil && *snapshot.Status.ReadyToUse
+}
+
+func getVolumeSnapshotErrMsg(snapshot *v1.VolumeSnapshot) string {
+	if snapshot == nil || snapshot.Status == nil || snapshot.Status.Error == nil ||
+		snapshot.Status.Error.Message == nil {
+		return ""
+	}
+
+	return *snapshot.Status.Error.Message
+}
+
+func getWorkspaceSnapshotK8sName(snapshot *cordiumv1.WorkspaceSnapshot) string {
+	return fmt.Sprintf("wss-%s", snapshot.Metadata.Uid)
+}

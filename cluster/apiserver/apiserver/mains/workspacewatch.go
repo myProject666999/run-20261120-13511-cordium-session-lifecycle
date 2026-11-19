@@ -1,0 +1,215 @@
+/*
+ * Copyright Octelium Labs, LLC. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package mains
+
+import (
+	"context"
+	"sync"
+
+	"github.com/octelium/cordium/cluster/apiserver/apiserver/commonw"
+	"github.com/octelium/octelium/apis/main/cordiumv1"
+	"github.com/octelium/octelium/apis/main/metav1"
+	"github.com/octelium/octelium/cluster/common/apivalidation"
+	"github.com/octelium/octelium/cluster/common/userctx"
+	"github.com/octelium/octelium/pkg/apiutils/umetav1"
+	"github.com/octelium/octelium/pkg/utils/utilrand"
+	"go.uber.org/zap"
+)
+
+const watchWorkspaceBufferSize = 256
+
+func (s *Server) WatchWorkspace(req *cordiumv1.WatchWorkspaceRequest, stream cordiumv1.MainService_WatchWorkspaceServer) error {
+	ctx := stream.Context()
+
+	i, err := commonw.GetUserCtx(ctx)
+	if err != nil {
+		return err
+	}
+
+	var wsUID string
+	if req.WorkspaceRef != nil {
+		ws, err := s.GetWorkspace(ctx, apivalidation.ObjectReferenceToGetOptions(req.WorkspaceRef))
+		if err != nil {
+			return err
+		}
+		wsUID = ws.Metadata.Uid
+	}
+
+	sub := s.wsWatchMan.newSub(i, stream, wsUID)
+	defer s.wsWatchMan.removeSub(sub)
+
+	select {
+	case <-ctx.Done():
+	case <-sub.doneCh:
+	}
+
+	return nil
+}
+
+type watchWorkspaceSubscriptionManager struct {
+	mu sync.RWMutex
+	mp map[string]*watchWorkspaceSubscription
+}
+
+func (w *watchWorkspaceSubscriptionManager) newSub(i *userctx.UserCtx,
+	stream cordiumv1.MainService_WatchWorkspaceServer, wsUID string) *watchWorkspaceSubscription {
+	ret := &watchWorkspaceSubscription{
+		id:      utilrand.GetRandomString(16),
+		userUID: i.User.Metadata.Uid,
+		wsUID:   wsUID,
+		stream:  stream,
+		msgCh:   make(chan *cordiumv1.WatchWorkspaceResponse, watchWorkspaceBufferSize),
+		doneCh:  make(chan struct{}),
+	}
+
+	w.mu.Lock()
+	w.mp[ret.id] = ret
+	w.mu.Unlock()
+
+	go ret.startSendLoop()
+
+	return ret
+}
+
+func (w *watchWorkspaceSubscriptionManager) removeSub(s *watchWorkspaceSubscription) {
+	w.mu.Lock()
+	delete(w.mp, s.id)
+	w.mu.Unlock()
+
+	s.close()
+}
+
+func (w *watchWorkspaceSubscriptionManager) len() int {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return len(w.mp)
+}
+
+func (w *watchWorkspaceSubscriptionManager) onCreate(ctx context.Context, ws *cordiumv1.Workspace) error {
+	if ws.Status.UserRef == nil {
+		return nil
+	}
+	msg := &cordiumv1.WatchWorkspaceResponse{
+		Type: &cordiumv1.WatchWorkspaceResponse_Create_{
+			Create: &cordiumv1.WatchWorkspaceResponse_Create{
+				Item: ws,
+			},
+		},
+	}
+
+	return w.publishMsg(msg, ws.Status.UserRef, umetav1.GetObjectReference(ws))
+}
+
+func (w *watchWorkspaceSubscriptionManager) onUpdate(ctx context.Context, new, old *cordiumv1.Workspace) error {
+	if new.Status.UserRef == nil || old.Status.UserRef == nil {
+		return nil
+	}
+	msg := &cordiumv1.WatchWorkspaceResponse{
+		Type: &cordiumv1.WatchWorkspaceResponse_Update_{
+			Update: &cordiumv1.WatchWorkspaceResponse_Update{
+				NewItem: new,
+				OldItem: old,
+			},
+		},
+	}
+
+	return w.publishMsg(msg, new.Status.UserRef, umetav1.GetObjectReference(new))
+}
+
+func (w *watchWorkspaceSubscriptionManager) onDelete(ctx context.Context, ws *cordiumv1.Workspace) error {
+	if ws.Status.UserRef == nil {
+		return nil
+	}
+	msg := &cordiumv1.WatchWorkspaceResponse{
+		Type: &cordiumv1.WatchWorkspaceResponse_Delete_{
+			Delete: &cordiumv1.WatchWorkspaceResponse_Delete{
+				Item: ws,
+			},
+		},
+	}
+
+	return w.publishMsg(msg, ws.Status.UserRef, umetav1.GetObjectReference(ws))
+}
+
+func (w *watchWorkspaceSubscriptionManager) publishMsg(msg *cordiumv1.WatchWorkspaceResponse,
+	usrRef *metav1.ObjectReference, wsRef *metav1.ObjectReference) error {
+
+	usrUID := usrRef.Uid
+
+	var laggingSubs []*watchWorkspaceSubscription
+
+	w.mu.RLock()
+	for _, sub := range w.mp {
+		if sub.userUID != usrUID {
+			continue
+		}
+		if sub.wsUID != "" && sub.wsUID != wsRef.Uid {
+			continue
+		}
+
+		select {
+		case sub.msgCh <- msg:
+		default:
+			laggingSubs = append(laggingSubs, sub)
+		}
+	}
+	w.mu.RUnlock()
+
+	for _, sub := range laggingSubs {
+		zap.L().Warn("Dropping a lagging WatchWorkspace subscriber", zap.String("subID", sub.id))
+		w.removeSub(sub)
+	}
+
+	return nil
+}
+
+type watchWorkspaceSubscription struct {
+	id      string
+	userUID string
+	wsUID   string
+	stream  cordiumv1.MainService_WatchWorkspaceServer
+
+	msgCh     chan *cordiumv1.WatchWorkspaceResponse
+	doneCh    chan struct{}
+	closeOnce sync.Once
+}
+
+func (s *watchWorkspaceSubscription) close() {
+	s.closeOnce.Do(func() {
+		close(s.doneCh)
+	})
+}
+
+func (s *watchWorkspaceSubscription) startSendLoop() {
+	ctx := s.stream.Context()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.doneCh:
+			return
+		case msg := <-s.msgCh:
+			if err := s.stream.Send(msg); err != nil {
+				zap.L().Debug("Could not send WatchWorkspaceResponse",
+					zap.String("subID", s.id), zap.Error(err))
+				s.close()
+				return
+			}
+		}
+	}
+}

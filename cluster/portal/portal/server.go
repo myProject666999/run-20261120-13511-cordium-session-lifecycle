@@ -1,0 +1,257 @@
+/*
+ * Copyright Octelium Labs, LLC. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package portal
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"os"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/octelium/cordium/cluster/common/octeliumc"
+	"github.com/octelium/cordium/cluster/common/suputils"
+	"github.com/octelium/cordium/cluster/common/watchers"
+	"github.com/octelium/cordium/cluster/common/wsutils"
+	"github.com/octelium/cordium/cluster/portal/portal/acache"
+	wscontroller "github.com/octelium/cordium/cluster/portal/portal/controllers/workspaces"
+	"github.com/octelium/cordium/cluster/portal/portal/middlewares/auth"
+	"github.com/octelium/octelium/apis/main/metav1"
+	"github.com/octelium/octelium/apis/rsc/rmetav1"
+	"github.com/octelium/octelium/cluster/common/commoninit"
+	"github.com/octelium/octelium/cluster/common/healthcheck"
+	"github.com/octelium/octelium/cluster/common/httputils"
+	"github.com/octelium/octelium/cluster/common/vutils"
+	"github.com/octelium/octelium/pkg/apiutils/umetav1"
+	"github.com/pkg/errors"
+	"go.uber.org/zap"
+)
+
+type Server struct {
+	octeliumC octeliumc.ClientInterface
+
+	svcUID string
+
+	// jwkCtl        *jwkctl.Controller
+	clusterDomain string
+	tunnelSrv     *tunnelSrv
+	aCache        *acache.Cache
+
+	activityCtl *wsutils.ActivityCtl
+
+	srvErr chan error
+
+	dctxMap struct {
+		dctxMap map[string]*dctx
+		mu      sync.RWMutex
+	}
+
+	regionRef *metav1.ObjectReference
+
+	// workspaceMap *workspaceMap
+
+	rootURL      string
+	supClientMap *suputils.SupervisorCMap
+}
+
+func newServer(ctx context.Context, octeliumC octeliumc.ClientInterface) (*Server, error) {
+
+	var err error
+	ret := &Server{
+		octeliumC: octeliumC,
+		svcUID:    os.Getenv("OCTELIUM_SVC_UID"),
+		/*
+			workspaceMap: &workspaceMap{
+				wsMap: make(map[string]*workspaceCtx),
+			},
+		*/
+	}
+
+	ret.dctxMap.dctxMap = make(map[string]*dctx)
+	ret.srvErr = make(chan error, 1)
+
+	cc, err := octeliumC.CoreV1Utils().GetClusterConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	ret.aCache, err = acache.NewCache()
+	if err != nil {
+		return nil, err
+	}
+	ret.activityCtl, err = wsutils.NewActivityCtl(octeliumC)
+	if err != nil {
+		return nil, err
+	}
+
+	ret.clusterDomain = cc.Status.Domain
+
+	region, err := octeliumC.CoreC().GetRegion(ctx, &rmetav1.GetOptions{Name: vutils.GetMyRegionName()})
+	if err != nil {
+		return nil, errors.Errorf("Could not get my region: %+v", err)
+	}
+
+	ret.regionRef = umetav1.GetObjectReference(region)
+
+	ret.supClientMap = suputils.NewSupervisorCtxMap(ret.regionRef)
+
+	ret.tunnelSrv, err = newTunnelSrv(ctx, octeliumC, ret.aCache, cc.Status.Domain, ret.activityCtl, ret.regionRef)
+	if err != nil {
+		return nil, errors.Errorf("Could not create tunnelSrv: %+v", err)
+	}
+
+	svc, err := octeliumC.CoreC().GetService(ctx, &rmetav1.GetOptions{
+		Uid: ret.svcUID,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	ret.rootURL = fmt.Sprintf("https://%s", vutils.GetServicePublicFQDN(svc, ret.clusterDomain))
+
+	return ret, nil
+}
+
+var rgxGitProviderBegin = regexp.MustCompile(`^\/auth\/v1\/begin\/(?P<ws>[a-z0-9-]{36})$`)
+
+func getForwardedHostPrefix(hdr string, domain string) string {
+	return strings.TrimSuffix(hdr, fmt.Sprintf(".%s", domain))
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+
+	switch {
+	case rgx.MatchString(getForwardedHostPrefix(r.Header.Get("X-Forwarded-Host"), s.clusterDomain)):
+		s.tunnelSrv.ServeHTTP(w, r)
+		return
+	case r.URL.Path == "/" && r.Method == "GET":
+		s.handleIndex(w, r)
+		return
+	case r.URL.Path == "/connect":
+		s.handleConnect(w, r)
+		return
+	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/assets/"):
+		s.handleAsset(w, r)
+		return
+	case r.Method == "POST" && rgxGitProviderBegin.MatchString(r.URL.Path):
+		s.handleAuthGitProviderBegin(w, r)
+		return
+	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/auth/v1/callback"):
+		s.handleAuthGitProviderCallback(w, r)
+		return
+	case r.Method == "GET":
+		s.handleIndex(w, r)
+		return
+	default:
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+func (s *Server) Run(ctx context.Context) error {
+
+	if err := s.activityCtl.Run(ctx); err != nil {
+		return err
+	}
+
+	handler, err := s.getHTTPHandler(ctx)
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		srv := &http.Server{
+			Handler:           handler,
+			Addr:              vutils.ManagedServiceAddr,
+			WriteTimeout:      15 * time.Second,
+			ReadHeaderTimeout: 15 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    32 * 1024,
+		}
+
+		err := srv.ListenAndServe()
+		zap.L().Warn("Portal HTTP server exited", zap.Error(err))
+
+		select {
+		case s.srvErr <- err:
+		default:
+		}
+	}()
+
+	return nil
+}
+
+func (s *Server) getHTTPHandler(ctx context.Context) (http.Handler, error) {
+	chain := httputils.New()
+
+	chain = chain.Append(func(next http.Handler) (http.Handler, error) {
+		return auth.New(ctx, next, s.octeliumC)
+	})
+
+	handler, err := chain.Then(s)
+	if err != nil {
+		return nil, err
+	}
+
+	handler = http.AllowQuerySemicolons(handler)
+
+	return handler, nil
+}
+
+func Run(ctx context.Context) error {
+	if err := commoninit.Run(ctx, nil); err != nil {
+		return err
+	}
+
+	octeliumC, err := octeliumc.NewClient(ctx, nil)
+	if err != nil {
+		return err
+	}
+
+	s, err := newServer(ctx, octeliumC)
+	if err != nil {
+		return err
+	}
+
+	if err := s.Run(ctx); err != nil {
+		return err
+	}
+
+	ctl, err := wscontroller.NewController(s.aCache, s)
+	if err != nil {
+		return err
+	}
+
+	if err := watchers.NewCordiumV1(s.octeliumC).Workspace(ctx, nil,
+		ctl.OnAdd, ctl.OnUpdate, ctl.OnDelete,
+	); err != nil {
+		return err
+	}
+
+	healthcheck.Run(vutils.HealthCheckPortManagedService)
+	zap.S().Infof("Workspace Portal is running...")
+
+	select {
+	case <-ctx.Done():
+	case err := <-s.srvErr:
+		return errors.Errorf("The Portal HTTP server exited: %+v", err)
+	}
+
+	return nil
+}

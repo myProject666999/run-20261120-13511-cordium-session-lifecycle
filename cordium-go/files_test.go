@@ -1,0 +1,631 @@
+/*
+ * Copyright Octelium Labs, LLC. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package cordium
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/octelium/octelium/apis/main/cordiumv1"
+	"google.golang.org/grpc"
+)
+
+// shellFS stands in for the Workspace filesystem and interprets the two shell
+// pipelines that the transfer helpers build, the way a real shell would.
+type shellFS struct {
+	files map[string][]byte
+}
+
+// parseUpload and parseDownload read back the pipelines that the transfer
+// helpers build, and shellUnquote undoes the quoting that ShellQuote applied.
+func parseUpload(cmd string) (remotePath string, want int, ok bool) {
+	const marker = "| base64 -d > "
+	idx := strings.LastIndex(cmd, marker)
+	if idx < 0 {
+		return "", 0, false
+	}
+	remotePath = shellUnquote(strings.TrimSpace(cmd[idx+len(marker):]))
+
+	prefix := cmd[:idx]
+	hidx := strings.LastIndex(prefix, "head -c ")
+	if hidx < 0 {
+		return "", 0, false
+	}
+	want, err := strconv.Atoi(strings.TrimSpace(prefix[hidx+len("head -c "):]))
+	if err != nil {
+		return "", 0, false
+	}
+	return remotePath, want, true
+}
+
+func parseDownload(cmd string) (remotePath string, ok bool) {
+	const marker = "base64 < "
+	if !strings.HasPrefix(cmd, marker) {
+		return "", false
+	}
+	return shellUnquote(strings.TrimSpace(cmd[len(marker):])), true
+}
+
+func shellUnquote(s string) string {
+	if !strings.HasPrefix(s, "'") {
+		return s
+	}
+
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		switch {
+		case s[i] == '\'':
+			j := strings.IndexByte(s[i+1:], '\'')
+			if j < 0 {
+				b.WriteString(s[i+1:])
+				return b.String()
+			}
+			b.WriteString(s[i+1 : i+1+j])
+			i += j + 2
+		case s[i] == '\\' && i+1 < len(s):
+			b.WriteByte(s[i+1])
+			i += 2
+		default:
+			b.WriteByte(s[i])
+			i++
+		}
+	}
+	return b.String()
+}
+
+func (s *shellFS) script(req *cordiumv1.ExecRequest_Request,
+	srv grpc.BidiStreamingServer[cordiumv1.ExecRequest, cordiumv1.ExecResponse]) error {
+
+	if path, want, ok := parseUpload(req.GetCommand()); ok {
+
+		// `head -c N` consumes exactly N bytes and then exits on its own.
+		var encoded []byte
+		for len(encoded) < want {
+			msg, err := srv.Recv()
+			if err != nil {
+				break
+			}
+			if data := msg.GetWriteData().GetData(); len(data) > 0 {
+				encoded = append(encoded, data...)
+			}
+		}
+		if len(encoded) > want {
+			encoded = encoded[:want]
+		}
+
+		decoded, err := base64.StdEncoding.DecodeString(string(encoded))
+		if err != nil {
+			_ = srv.Send(stderr("base64: invalid input"))
+			_ = srv.Send(exit(1))
+			<-srv.Context().Done()
+			return nil
+		}
+
+		s.files[path] = decoded
+		_ = srv.Send(exit(0))
+		<-srv.Context().Done()
+		return nil
+	}
+
+	if path, ok := parseDownload(req.GetCommand()); ok {
+		content, ok := s.files[path]
+		if !ok {
+			_ = srv.Send(stderr("sh: cannot open " + path + ": No such file or directory"))
+			_ = srv.Send(exit(1))
+			<-srv.Context().Done()
+			return nil
+		}
+
+		// Real base64 wraps its output, which the decoder has to tolerate.
+		encoded := base64.StdEncoding.EncodeToString(content)
+		for i := 0; i < len(encoded); i += 76 {
+			end := min(i+76, len(encoded))
+			if err := srv.Send(stdout(encoded[i:end] + "\n")); err != nil {
+				return err
+			}
+		}
+		_ = srv.Send(exit(0))
+		<-srv.Context().Done()
+		return nil
+	}
+
+	_ = srv.Send(stderr("sh: unexpected command: " + req.GetCommand()))
+	_ = srv.Send(exit(127))
+	<-srv.Context().Done()
+	return nil
+}
+
+func fileWorkspace(t *testing.T) (*Workspace, *shellFS) {
+	t.Helper()
+
+	fs := &shellFS{files: map[string][]byte{}}
+	fake := newFakeCluster()
+	fake.execScript = fs.script
+
+	c := startFakeCluster(t, fake)
+	return testWorkspace(t, c), fs
+}
+
+func TestWriteAndReadFile(t *testing.T) {
+	ws, fs := fileWorkspace(t)
+
+	content := []byte("{\n  \"debug\": true\n}\n")
+	if err := ws.WriteFile(t.Context(), "/workspace/repo/config.json", content); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if got := fs.files["/workspace/repo/config.json"]; !bytes.Equal(got, content) {
+		t.Errorf("the Workspace holds %q, want %q", got, content)
+	}
+
+	read, err := ws.ReadFile(t.Context(), "/workspace/repo/config.json")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(read, content) {
+		t.Errorf("ReadFile = %q, want %q", read, content)
+	}
+
+	str, err := ws.ReadFileString(t.Context(), "/workspace/repo/config.json")
+	if err != nil || str != string(content) {
+		t.Errorf("ReadFileString = %q, %v", str, err)
+	}
+}
+
+func TestWriteFileHandlesBinaryAndSizes(t *testing.T) {
+	ws, fs := fileWorkspace(t)
+
+	for _, size := range []int{0, 1, 2, 3, 4, 1023, 4096, 300 * 1024} {
+		content := make([]byte, size)
+		if _, err := rand.Read(content); err != nil {
+			t.Fatalf("rand: %v", err)
+		}
+
+		path := "/tmp/blob-" + strconv.Itoa(size)
+		if err := ws.WriteFile(t.Context(), path, content); err != nil {
+			t.Fatalf("WriteFile(%d bytes): %v", size, err)
+		}
+		if got := fs.files[path]; !bytes.Equal(got, content) {
+			t.Fatalf("%d bytes round-tripped to %d bytes", size, len(got))
+		}
+
+		read, err := ws.ReadFile(t.Context(), path)
+		if err != nil {
+			t.Fatalf("ReadFile(%d bytes): %v", size, err)
+		}
+		if !bytes.Equal(read, content) {
+			t.Fatalf("ReadFile(%d bytes) returned %d bytes", size, len(read))
+		}
+	}
+}
+
+func TestWriteFileQuotesPaths(t *testing.T) {
+	ws, fs := fileWorkspace(t)
+
+	path := "/workspace/my repo/it's a file.txt"
+	if err := ws.WriteFileString(t.Context(), path, "hello"); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if string(fs.files[path]) != "hello" {
+		t.Errorf("the Workspace holds %q", fs.files[path])
+	}
+
+	read, err := ws.ReadFileString(t.Context(), path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if read != "hello" {
+		t.Errorf("ReadFile = %q", read)
+	}
+}
+
+func TestUploadAndDownloadFile(t *testing.T) {
+	ws, fs := fileWorkspace(t)
+	dir := t.TempDir()
+
+	content := make([]byte, 200*1024)
+	if _, err := rand.Read(content); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+
+	local := filepath.Join(dir, "artifact.bin")
+	if err := os.WriteFile(local, content, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if err := ws.UploadFile(t.Context(), local, "/workspace/artifact.bin"); err != nil {
+		t.Fatalf("UploadFile: %v", err)
+	}
+	if !bytes.Equal(fs.files["/workspace/artifact.bin"], content) {
+		t.Error("the uploaded file does not match")
+	}
+
+	out := filepath.Join(dir, "nested", "copy.bin")
+	if err := ws.DownloadFile(t.Context(), "/workspace/artifact.bin", out); err != nil {
+		t.Fatalf("DownloadFile: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Error("the downloaded file does not match")
+	}
+
+	var buf bytes.Buffer
+	if err := ws.DownloadFileTo(t.Context(), "/workspace/artifact.bin", &buf); err != nil {
+		t.Fatalf("DownloadFileTo: %v", err)
+	}
+	if !bytes.Equal(buf.Bytes(), content) {
+		t.Error("DownloadFileTo does not match")
+	}
+}
+
+func TestDownloadMissingFileFails(t *testing.T) {
+	ws, _ := fileWorkspace(t)
+
+	_, err := ws.ReadFile(t.Context(), "/workspace/nope.txt")
+	if err == nil {
+		t.Fatal("reading a missing file succeeded")
+	}
+	if !strings.Contains(err.Error(), "No such file") {
+		t.Errorf("err = %v, want the shell's own message", err)
+	}
+
+	// A failed download must not leave a truncated local file behind.
+	out := filepath.Join(t.TempDir(), "out.bin")
+	if err := ws.DownloadFile(t.Context(), "/workspace/nope.txt", out); err == nil {
+		t.Fatal("DownloadFile succeeded for a missing file")
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Error("a failed download left a local file behind")
+	}
+}
+
+func TestReadFileRespectsItsSizeCap(t *testing.T) {
+	ws, fs := fileWorkspace(t)
+	fs.files["/big"] = bytes.Repeat([]byte("x"), 64*1024)
+
+	if _, err := ws.ReadFile(t.Context(), "/big", WithMaxCaptureBytes(1024)); err == nil {
+		t.Fatal("ReadFile ignored its size cap")
+	}
+
+	fs.files["/default-cap"] = bytes.Repeat([]byte("x"), defaultMaxCaptureBytes+1)
+	if _, err := ws.ReadFile(t.Context(), "/default-cap",
+		WithMaxCaptureBytes(defaultMaxCaptureBytes)); err == nil {
+		t.Fatal("ReadFile ignored an explicit cap equal to the exec default")
+	}
+
+	// The same file still streams through DownloadFileTo.
+	var buf bytes.Buffer
+	if err := ws.DownloadFileTo(t.Context(), "/big", &buf); err != nil {
+		t.Fatalf("DownloadFileTo: %v", err)
+	}
+	if buf.Len() != 64*1024 {
+		t.Errorf("streamed %d bytes", buf.Len())
+	}
+}
+
+func TestFileHelpersRejectEmptyPaths(t *testing.T) {
+	ws, _ := fileWorkspace(t)
+
+	if err := ws.WriteFile(t.Context(), "", nil); !IsInvalidArgument(err) {
+		t.Errorf("an empty remote path: %v", err)
+	}
+	if _, err := ws.ReadFile(t.Context(), ""); !IsInvalidArgument(err) {
+		t.Errorf("an empty remote path: %v", err)
+	}
+	if err := ws.DownloadFile(t.Context(), "/x", ""); !IsInvalidArgument(err) {
+		t.Errorf("an empty local path: %v", err)
+	}
+	if err := ws.DownloadFileTo(t.Context(), "/x", nil); !IsInvalidArgument(err) {
+		t.Errorf("a nil writer: %v", err)
+	}
+	if err := ws.UploadFile(t.Context(), t.TempDir(), "/x"); !IsInvalidArgument(err) {
+		t.Errorf("uploading a directory: %v", err)
+	}
+	if err := ws.UploadFile(t.Context(), filepath.Join(t.TempDir(), "nope"), "/x"); !os.IsNotExist(err) {
+		t.Errorf("uploading a missing file: %v", err)
+	}
+}
+
+func TestReadFileCaptureBoundaries(t *testing.T) {
+	for _, size := range []int{0, 1, 3, 1024} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			ws, fs := fileWorkspace(t)
+			content := bytes.Repeat([]byte("x"), size)
+			fs.files["/file"] = content
+			got, err := ws.ReadFile(t.Context(), "/file", WithMaxCaptureBytes(size))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, content) {
+				t.Errorf("read %d bytes, want %d", len(got), size)
+			}
+			if size > 0 {
+				if _, err := ws.ReadFile(t.Context(), "/file", WithMaxCaptureBytes(size-1)); err == nil {
+					t.Error("reading over the limit succeeded")
+				}
+			}
+		})
+	}
+}
+
+func TestDownloadFileErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		output string
+		code   int32
+		stderr string
+		want   string
+	}{
+		{name: "malformed base64", output: "not base64!", want: "base64"},
+		{name: "incomplete base64", output: "YQ", want: "unexpected EOF"},
+		{name: "remote failure", code: 23, want: "exited with code 23"},
+		{name: "remote diagnostic", code: 1, stderr: "permission denied\n", want: "permission denied"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeCluster()
+			fake.execScript = func(req *cordiumv1.ExecRequest_Request, srv grpc.BidiStreamingServer[cordiumv1.ExecRequest, cordiumv1.ExecResponse]) error {
+				for _, message := range []*cordiumv1.ExecResponse{stdout(tc.output), stderr(tc.stderr), exit(tc.code)} {
+					if err := srv.Send(message); err != nil {
+						return err
+					}
+				}
+				<-srv.Context().Done()
+				return nil
+			}
+			ws := testWorkspace(t, startFakeCluster(t, fake))
+			out := filepath.Join(t.TempDir(), "nested", "file")
+			err := ws.DownloadFile(t.Context(), "/remote", out, WithExecTimeout(2*time.Second))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("DownloadFile error = %v, want %q", err, tc.want)
+			}
+			if _, err := os.Stat(out); !os.IsNotExist(err) {
+				t.Errorf("failed download left a partial file: %v", err)
+			}
+		})
+	}
+}
+
+func TestDownloadFilePropagatesWriterFailure(t *testing.T) {
+	ws, fs := fileWorkspace(t)
+	fs.files["/file"] = bytes.Repeat([]byte("x"), 4096)
+	wantErr := errors.New("disk full")
+	err := ws.DownloadFileTo(t.Context(), "/file", execErrorWriter{err: wantErr}, WithExecTimeout(2*time.Second))
+	if !errors.Is(err, wantErr) {
+		t.Errorf("DownloadFileTo error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestDownloadFailurePreservesExistingFile(t *testing.T) {
+	for _, remote := range []string{"", "/missing"} {
+		t.Run("remote="+remote, func(t *testing.T) {
+			ws, _ := fileWorkspace(t)
+			out := filepath.Join(t.TempDir(), "existing.txt")
+			if err := os.WriteFile(out, []byte("original"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := ws.DownloadFile(t.Context(), remote, out); err == nil {
+				t.Fatal("download succeeded unexpectedly")
+			}
+			got, err := os.ReadFile(out)
+			if err != nil || string(got) != "original" {
+				t.Errorf("failed download destroyed the existing destination: content=%q, error=%v", got, err)
+			}
+		})
+	}
+}
+
+func dirEntries(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return names
+}
+
+func TestDownloadFileReplacesExistingFile(t *testing.T) {
+	ws, fs := fileWorkspace(t)
+	fs.files["/remote"] = []byte("updated")
+	dir := t.TempDir()
+	out := filepath.Join(dir, "existing.txt")
+	if err := os.WriteFile(out, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(out, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := ws.DownloadFile(t.Context(), "/remote", out); err != nil {
+		t.Fatalf("DownloadFile: %v", err)
+	}
+	if got, err := os.ReadFile(out); err != nil || string(got) != "updated" {
+		t.Errorf("content = %q, %v, want %q", got, err, "updated")
+	}
+	info, err := os.Stat(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o640 {
+		t.Errorf("mode = %v, want %v", info.Mode().Perm(), os.FileMode(0o640))
+	}
+	if names := dirEntries(t, dir); !slices.Equal(names, []string{"existing.txt"}) {
+		t.Errorf("directory holds %v, want only the destination", names)
+	}
+}
+
+func TestDownloadFileCreatesFileWithDefaultMode(t *testing.T) {
+	ws, fs := fileWorkspace(t)
+	fs.files["/remote"] = []byte("content")
+	dir := t.TempDir()
+	reference, err := os.Create(filepath.Join(dir, "reference"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reference.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "new.txt")
+	if err := ws.DownloadFile(t.Context(), "/remote", out); err != nil {
+		t.Fatalf("DownloadFile: %v", err)
+	}
+	want, err := os.Stat(reference.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.Stat(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode() != want.Mode() {
+		t.Errorf("mode = %v, want %v", got.Mode(), want.Mode())
+	}
+}
+
+func TestDownloadFileMidStreamFailurePreservesExistingFile(t *testing.T) {
+	fake := newFakeCluster()
+	fake.execScript = func(req *cordiumv1.ExecRequest_Request, srv grpc.BidiStreamingServer[cordiumv1.ExecRequest, cordiumv1.ExecResponse]) error {
+		for _, message := range []*cordiumv1.ExecResponse{stdout(base64.StdEncoding.EncodeToString([]byte("partial"))), stderr("read error\n"), exit(1)} {
+			if err := srv.Send(message); err != nil {
+				return err
+			}
+		}
+		<-srv.Context().Done()
+		return nil
+	}
+	ws := testWorkspace(t, startFakeCluster(t, fake))
+	dir := t.TempDir()
+	out := filepath.Join(dir, "existing.txt")
+	if err := os.WriteFile(out, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := ws.DownloadFile(t.Context(), "/remote", out, WithExecTimeout(2*time.Second))
+	if err == nil || !strings.Contains(err.Error(), "read error") {
+		t.Errorf("DownloadFile error = %v, want the remote diagnostic", err)
+	}
+	if got, err := os.ReadFile(out); err != nil || string(got) != "original" {
+		t.Errorf("failed download changed the existing destination: content=%q, error=%v", got, err)
+	}
+	if names := dirEntries(t, dir); !slices.Equal(names, []string{"existing.txt"}) {
+		t.Errorf("directory holds %v, want only the destination", names)
+	}
+}
+
+func TestDownloadFileThroughSymlink(t *testing.T) {
+	ws, fs := fileWorkspace(t)
+	fs.files["/remote"] = []byte("updated")
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.txt")
+	if err := os.WriteFile(target, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.txt")
+	if err := os.Symlink("target.txt", link); err != nil {
+		t.Skipf("symlinks are not supported: %v", err)
+	}
+	if err := ws.DownloadFile(t.Context(), "/remote", link); err != nil {
+		t.Fatalf("DownloadFile: %v", err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "updated" {
+		t.Errorf("target content = %q, %v, want %q", got, err, "updated")
+	}
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Error("the symlink was replaced by a regular file")
+	}
+	if names := dirEntries(t, dir); !slices.Equal(names, []string{"link.txt", "target.txt"}) {
+		t.Errorf("directory holds %v, want only the link and its target", names)
+	}
+}
+
+func TestDownloadFileRespectsReadOnlyFile(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can write to read-only files")
+	}
+	ws, fs := fileWorkspace(t)
+	fs.files["/remote"] = []byte("updated")
+	out := filepath.Join(t.TempDir(), "readonly.txt")
+	if err := os.WriteFile(out, []byte("original"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := ws.DownloadFile(t.Context(), "/remote", out); !errors.Is(err, os.ErrPermission) {
+		t.Errorf("DownloadFile error = %v, want a permission error", err)
+	}
+	if got, err := os.ReadFile(out); err != nil || string(got) != "original" {
+		t.Errorf("read-only destination changed: content=%q, error=%v", got, err)
+	}
+}
+
+func TestDownloadFileRejectsDirectory(t *testing.T) {
+	ws, fs := fileWorkspace(t)
+	fs.files["/remote"] = []byte("content")
+	dir := t.TempDir()
+	if err := ws.DownloadFile(t.Context(), "/remote", dir); err == nil {
+		t.Fatal("DownloadFile replaced a directory")
+	}
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		t.Errorf("destination directory changed: %v, %v", info, err)
+	}
+	if names := dirEntries(t, dir); len(names) != 0 {
+		t.Errorf("directory holds %v, want nothing", names)
+	}
+}
+
+func TestDownloadFileToDevice(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a regression must not be able to replace the device as root")
+	}
+	before, err := os.Stat(os.DevNull)
+	if err != nil || before.Mode().IsRegular() {
+		t.Skipf("%s is not a device: %v", os.DevNull, err)
+	}
+	ws, fs := fileWorkspace(t)
+	fs.files["/remote"] = []byte("content")
+	if err := ws.DownloadFile(t.Context(), "/remote", os.DevNull); err != nil {
+		t.Fatalf("DownloadFile: %v", err)
+	}
+	after, err := os.Stat(os.DevNull)
+	if err != nil || after.Mode() != before.Mode() {
+		t.Errorf("%s mode = %v, %v, want %v", os.DevNull, after, err, before.Mode())
+	}
+}
+
+func TestUploadRejectsInvalidSizes(t *testing.T) {
+	ws, _ := fileWorkspace(t)
+	for _, size := range []int64{-1, maxInt/2 + 1} {
+		if err := ws.upload(t.Context(), "/file", size, strings.NewReader("")); !IsInvalidArgument(err) {
+			t.Errorf("upload size %d: %v", size, err)
+		}
+	}
+}

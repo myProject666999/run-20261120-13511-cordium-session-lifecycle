@@ -1,0 +1,13 @@
+
+FROM golang:1.27.4 AS builder
+RUN mkdir /build
+ADD . /build/
+WORKDIR /build
+RUN make build-nocturne
+FROM alpine:3.24
+RUN apk --no-cache add ca-certificates
+RUN adduser -S -D -H -u 3454 -h /app octelium
+USER octelium
+COPY --from=builder /build/bin/cordium-nocturne /bin/
+ENTRYPOINT ["/bin/cordium-nocturne"]
+

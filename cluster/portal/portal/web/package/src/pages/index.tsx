@@ -1,0 +1,99 @@
+import Footer from "@/components/Footer";
+import PortalShell from "@/components/SideBar/Shell";
+import TopBar from "@/components/TopBar";
+
+import { Navigate, Outlet, useMatch } from "react-router-dom";
+
+import { setStatus } from "@/features/settings/slice";
+import { getClientUser, getClientWorkspace } from "@/utils/client";
+import { useAppDispatch, useAppSelector } from "@/utils/hooks";
+import { useThemeColorMeta } from "@/utils/theme/colorScheme";
+
+import { Notifications } from "@mantine/notifications";
+import { useQuery } from "@tanstack/react-query";
+
+import { invalidateSpaces } from "@/utils/octelium";
+import {
+  ListSpaceOptions,
+  Space,
+  Space_Status_Type,
+} from "@octelium/apis/main/cordiumv1";
+
+import "@fontsource/jetbrains-mono/400.css";
+import "@fontsource/jetbrains-mono/700.css";
+import "@fontsource/plus-jakarta-sans/500.css";
+import "@fontsource/plus-jakarta-sans/600.css";
+import "@fontsource/plus-jakarta-sans/700.css";
+
+const Root = () => {
+  const dispatch = useAppDispatch();
+  const consoleWide = useAppSelector((s) => s.settings.terminalFullscreen);
+  const isAgent = !!useMatch({ path: "/agent", end: false });
+
+  useThemeColorMeta();
+
+  useQuery({
+    queryKey: ["user/getStatus"],
+    queryFn: async () => {
+      const { response } = await getClientUser().getStatus({});
+      dispatch(setStatus({ status: response }));
+
+      const wsResp = await getClientWorkspace().listSpace(
+        ListSpaceOptions.create({ type: Space_Status_Type.USER }),
+      );
+      if (wsResp.response && wsResp.response.items.length === 0) {
+        await getClientWorkspace().createSpace(
+          Space.create({
+            metadata: {
+              name: `default.${response.user!.metadata!.name}`,
+              displayName: "Default Space",
+            },
+            spec: {},
+            status: { type: Space_Status_Type.USER },
+          }),
+        );
+        invalidateSpaces();
+      }
+
+      return response;
+    },
+  });
+
+  return (
+    <PortalShell header={<TopBar />}>
+      {isAgent ? (
+        <div className="h-[calc(100dvh-60px)] w-full">
+          <Outlet />
+        </div>
+      ) : (
+        <div
+          className={
+            consoleWide
+              ? "w-full px-4 py-6 md:px-8"
+              : "mx-auto w-full max-w-[1400px] px-4 py-6 md:px-8"
+          }
+        >
+          <Outlet />
+          <Footer />
+        </div>
+      )}
+    </PortalShell>
+  );
+};
+
+const Page = () => {
+  const urlSearchParams = new URLSearchParams(window.location.search);
+  const redirect = urlSearchParams.get("redirect");
+  if (redirect) {
+    return <Navigate to={redirect} replace />;
+  }
+
+  return (
+    <>
+      <Root />
+      <Notifications position="bottom-center" />
+    </>
+  );
+};
+
+export default Page;

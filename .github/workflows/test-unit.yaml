@@ -1,0 +1,52 @@
+name: tests-unit-test
+on:
+  push:
+    tags:
+      - v*
+    branches:
+      # - master
+      - main
+      # - dev*
+      - t-*
+      - dev-*
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: postgres
+      redis:
+        image: redis
+        ports:
+          - 6379:6379
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v4
+      - name: Set up go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+          cache-dependency-path: "**/go.sum"
+      - name: Install psql
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client git
+      - name: Set ENV variables
+        env:
+          ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+        run: for v in `cat .github/workflows/env` ; do echo "::set-env name=${v%%=*}::${v##*=}" ; done
+      - name: Create database
+        run: psql -h localhost -U postgres -c 'CREATE DATABASE octelium;'
+        env:
+          PGPASSWORD: postgres
+      - name: Run tests
+        run: |
+          go version
+          which go
+          gocmd=$(which go)
+          sudo -E $gocmd version
+          sudo -E $gocmd test github.com/octelium/cordium/...

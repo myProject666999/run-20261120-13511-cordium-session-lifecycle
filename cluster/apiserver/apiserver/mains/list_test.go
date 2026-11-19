@@ -1,0 +1,389 @@
+/*
+ * Copyright Octelium Labs, LLC. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package mains
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/octelium/cordium/cluster/common/octeliumc"
+	"github.com/octelium/cordium/cluster/common/ourscsrv"
+	otests "github.com/octelium/cordium/cluster/common/tests"
+	"github.com/octelium/octelium/apis/main/cordiumv1"
+	"github.com/octelium/octelium/apis/main/corev1"
+	"github.com/octelium/octelium/apis/main/metav1"
+	"github.com/octelium/octelium/cluster/apiserver/apiserver/admin"
+	"github.com/octelium/octelium/cluster/common/tests/tstuser"
+	"github.com/octelium/octelium/pkg/apiutils/umetav1"
+	"github.com/octelium/octelium/pkg/grpcerr"
+	"github.com/octelium/octelium/pkg/utils/utilrand"
+	"github.com/stretchr/testify/assert"
+	"go.uber.org/zap"
+)
+
+func tstAllowAllOwnSpace(t *testing.T, octeliumC octeliumc.ClientInterface) {
+
+	ctx := context.Background()
+	cc, err := octeliumC.CordiumV1Utils().GetClusterConfig(ctx)
+	assert.Nil(t, err, "%+v", err)
+
+	if cc.Spec.Space == nil {
+		cc.Spec.Space = &cordiumv1.ClusterConfig_Spec_Space{}
+	}
+
+	cc.Spec.Space = &cordiumv1.ClusterConfig_Spec_Space{
+		Ownership: &cordiumv1.ClusterConfig_Spec_Space_Ownership{
+			Rules: []*cordiumv1.ClusterConfig_Spec_Space_Ownership_Rule{
+				{
+					Effect: cordiumv1.ClusterConfig_Spec_Space_Ownership_Rule_ALLOW,
+					Condition: &cordiumv1.Condition{
+						Type: &cordiumv1.Condition_MatchAny{
+							MatchAny: true,
+						},
+					},
+				},
+			},
+			/*
+				OrganizationRules: []*cordiumv1.ClusterConfig_Spec_Space_Ownership_Rule{
+					{
+						Effect: cordiumv1.ClusterConfig_Spec_Space_Ownership_Rule_ALLOW,
+						Conditions: []*metav1.Condition{
+							{
+								Type: &metav1.Condition_MatchAny{
+									MatchAny: true,
+								},
+							},
+						},
+					},
+				},
+			*/
+		},
+	}
+
+	_, err = octeliumC.CordiumC().UpdateClusterConfig(ctx, cc)
+	assert.Nil(t, err)
+}
+
+func TestList(t *testing.T) {
+
+	tst, err := otests.Initialize(nil)
+	assert.Nil(t, err, "%+v", err)
+	t.Cleanup(func() {
+		tst.Destroy()
+	})
+	fakeC := tst.C
+
+	srv, err := NewServer(context.Background(), fakeC.OcteliumC)
+	assert.Nil(t, err)
+	adminSrv := admin.NewServer(&admin.Opts{
+		OcteliumC:  fakeC.OcteliumC,
+		IsEmbedded: true,
+	})
+
+	tstAllowAllOwnSpace(t, fakeC.OcteliumC)
+
+	{
+		usr1, err := tstuser.NewUserWithType(fakeC.OcteliumC, adminSrv, nil, nil, corev1.User_Spec_HUMAN, corev1.Session_Status_CLIENTLESS)
+		assert.Nil(t, err)
+
+		usr2, err := tstuser.NewUserWithType(fakeC.OcteliumC, adminSrv, nil, nil, corev1.User_Spec_HUMAN, corev1.Session_Status_CLIENTLESS)
+		assert.Nil(t, err)
+
+		org1, err := srv.CreateSpace(usr1.Ctx(), &cordiumv1.Space{
+			Metadata: &metav1.Metadata{
+				Name: fmt.Sprintf("%s.cordium", utilrand.GetRandomStringCanonical(8)),
+			},
+			Spec: &cordiumv1.Space_Spec{},
+			Status: &cordiumv1.Space_Status{
+				Type: cordiumv1.Space_Status_ORGANIZATION,
+			},
+		})
+		assert.Nil(t, err, "%+v", err)
+
+		org2, err := srv.CreateSpace(usr1.Ctx(), &cordiumv1.Space{
+			Metadata: &metav1.Metadata{
+				Name: fmt.Sprintf("%s.cordium", utilrand.GetRandomStringCanonical(8)),
+			},
+			Spec: &cordiumv1.Space_Spec{},
+			Status: &cordiumv1.Space_Status{
+				Type: cordiumv1.Space_Status_ORGANIZATION,
+			},
+		})
+		assert.Nil(t, err)
+
+		zap.L().Debug("Creating mem", zap.Any("org1", org1))
+
+		{
+			_, err := srv.ListMembership(usr1.Ctx(), &cordiumv1.ListMembershipOptions{})
+			assert.NotNil(t, err, "%+v", err)
+			assert.True(t, grpcerr.IsInvalidArg(err))
+		}
+
+		{
+			memList, err := srv.ListMembership(usr1.Ctx(), &cordiumv1.ListMembershipOptions{
+				SpaceRef: umetav1.GetObjectReference(org1),
+			})
+			assert.Nil(t, err, "%+v", err)
+			assert.Equal(t, 1, len(memList.Items))
+		}
+
+		{
+			_, err := srv.ListMembership(usr2.Ctx(), &cordiumv1.ListMembershipOptions{
+				SpaceRef: umetav1.GetObjectReference(org1),
+			})
+			assert.NotNil(t, err)
+			assert.True(t, grpcerr.IsUnauthorized(err))
+		}
+
+		usr1Mem, err := srv.CreateMembership(usr1.Ctx(), &cordiumv1.CreateMembershipRequest{
+			UserType: &cordiumv1.CreateMembershipRequest_UserRef{
+				UserRef: umetav1.GetObjectReference(usr2.Usr),
+			},
+			SpaceRef: umetav1.GetObjectReference(org1),
+		})
+		assert.Nil(t, err)
+
+		{
+			memList, err := srv.ListMembership(usr2.Ctx(), &cordiumv1.ListMembershipOptions{
+				SpaceRef: umetav1.GetObjectReference(org1),
+			})
+			assert.Nil(t, err, "%+v", err)
+			assert.Equal(t, 2, len(memList.Items))
+		}
+
+		{
+			memList, err := srv.ListMembership(usr1.Ctx(), &cordiumv1.ListMembershipOptions{
+				SpaceRef: umetav1.GetObjectReference(org1),
+			})
+			assert.Nil(t, err, "%+v", err)
+			assert.Equal(t, 2, len(memList.Items))
+		}
+
+		{
+			orgList, err := srv.ListSpace(usr1.Ctx(), &cordiumv1.ListSpaceOptions{
+				Common: &metav1.CommonListOptions{
+					OrderBy: &metav1.CommonListOptions_OrderBy{
+						Type: metav1.CommonListOptions_OrderBy_CREATED_AT,
+						Mode: metav1.CommonListOptions_OrderBy_DESC,
+					},
+				},
+			})
+			assert.Nil(t, err, "%+v", err)
+			zap.L().Debug("orgList", zap.Any("orgList", orgList))
+			assert.Equal(t, 2, len(orgList.Items))
+			assert.Equal(t, org2.Metadata.Uid, orgList.Items[0].Metadata.Uid)
+		}
+
+		{
+			orgList, err := srv.ListSpace(usr2.Ctx(), &cordiumv1.ListSpaceOptions{})
+			assert.Nil(t, err, "%+v", err)
+			assert.Equal(t, 0, len(orgList.Items))
+		}
+
+		/*
+			{
+				orgList, err := srv.ListMembership(usr2.Ctx(), &cordiumv1.ListMembershipOptions{})
+				assert.Nil(t, err, "%+v", err)
+				assert.Equal(t, 1, len(orgList.Items))
+				assert.Equal(t, org1.Metadata.Uid, orgList.Items[0].Metadata.Uid)
+			}
+		*/
+
+		{
+			_, err := srv.ListTemplate(usr2.Ctx(), &cordiumv1.ListTemplateOptions{})
+			assert.NotNil(t, err)
+			assert.True(t, grpcerr.IsInvalidArg(err))
+		}
+
+		proj1, err := srv.CreateTemplate(usr1.Ctx(), &cordiumv1.Template{
+			Metadata: &metav1.Metadata{
+				Name: fmt.Sprintf("%s.%s", utilrand.GetRandomStringCanonical(8), org1.Metadata.Name),
+			},
+			Spec:   &cordiumv1.Template_Spec{},
+			Status: &cordiumv1.Template_Status{},
+		})
+		assert.Nil(t, err)
+
+		{
+			_, err := srv.ListTemplate(usr1.Ctx(), &cordiumv1.ListTemplateOptions{})
+			assert.NotNil(t, err)
+			assert.True(t, grpcerr.IsInvalidArg(err))
+		}
+
+		{
+			pList, err := srv.ListTemplate(usr1.Ctx(), &cordiumv1.ListTemplateOptions{
+				SpaceRef: umetav1.GetObjectReference(org1),
+				Common: &metav1.CommonListOptions{
+					OrderBy: &metav1.CommonListOptions_OrderBy{
+						Type: metav1.CommonListOptions_OrderBy_CREATED_AT,
+						Mode: metav1.CommonListOptions_OrderBy_DESC,
+					},
+				},
+			})
+			assert.Nil(t, err)
+			assert.Equal(t, 2, len(pList.Items))
+			assert.Equal(t, proj1.Metadata.Uid, pList.Items[0].Metadata.Uid)
+		}
+
+		{
+			_, err := srv.ListTemplate(usr2.Ctx(), &cordiumv1.ListTemplateOptions{})
+			assert.NotNil(t, err)
+			assert.True(t, grpcerr.IsInvalidArg(err))
+		}
+
+		{
+			_, err := srv.ListTemplate(usr2.Ctx(), &cordiumv1.ListTemplateOptions{
+				SpaceRef: umetav1.GetObjectReference(org2),
+			})
+			assert.NotNil(t, err)
+
+			assert.True(t, grpcerr.IsUnauthorized(err))
+		}
+
+		{
+			_, err := srv.ListTemplate(usr1.Ctx(), &cordiumv1.ListTemplateOptions{})
+			assert.NotNil(t, err)
+			assert.True(t, grpcerr.IsInvalidArg(err))
+		}
+
+		{
+			_, err := srv.ListTemplate(usr2.Ctx(), &cordiumv1.ListTemplateOptions{})
+			assert.NotNil(t, err)
+			assert.True(t, grpcerr.IsInvalidArg(err))
+		}
+
+		{
+
+			_, err = srv.DeleteMembership(usr1.Ctx(), &metav1.DeleteOptions{
+				Uid: usr1Mem.Metadata.Uid,
+			})
+			assert.Nil(t, err, "%+v", err)
+
+			{
+				memList, err := srv.ListMembership(usr1.Ctx(), &cordiumv1.ListMembershipOptions{
+					SpaceRef: umetav1.GetObjectReference(org1),
+				})
+				assert.Nil(t, err, "%+v", err)
+				assert.Equal(t, 1, len(memList.Items))
+			}
+			{
+				_, err := srv.ListMembership(usr2.Ctx(), &cordiumv1.ListMembershipOptions{
+					SpaceRef: umetav1.GetObjectReference(org1),
+				})
+				assert.NotNil(t, err)
+				assert.True(t, grpcerr.IsUnauthorized(err))
+			}
+
+			orgList, err := srv.ListSpace(usr2.Ctx(), &cordiumv1.ListSpaceOptions{})
+			assert.Nil(t, err)
+			assert.Equal(t, 0, len(orgList.Items))
+
+			{
+				_, err := srv.ListTemplate(usr2.Ctx(), &cordiumv1.ListTemplateOptions{})
+				assert.NotNil(t, err)
+				assert.True(t, grpcerr.IsInvalidArg(err))
+			}
+
+			{
+				_, err := srv.ListTemplate(usr2.Ctx(), &cordiumv1.ListTemplateOptions{})
+				assert.NotNil(t, err)
+				assert.True(t, grpcerr.IsInvalidArg(err))
+			}
+
+			{
+				_, err := srv.ListTemplate(usr2.Ctx(), &cordiumv1.ListTemplateOptions{
+					SpaceRef: umetav1.GetObjectReference(org1),
+				})
+				assert.NotNil(t, err)
+				assert.True(t, grpcerr.IsUnauthorized(err))
+			}
+
+		}
+
+	}
+}
+
+func TestSetCountOnly(t *testing.T) {
+
+	ctx := context.Background()
+
+	tst, err := otests.Initialize(nil)
+	assert.Nil(t, err, "%+v", err)
+	t.Cleanup(func() {
+		tst.Destroy()
+	})
+	fakeC := tst.C
+	tstAllowAllOwnSpace(t, fakeC.OcteliumC)
+
+	srv, err := NewServer(ctx, fakeC.OcteliumC)
+	assert.Nil(t, err)
+	adminSrv := admin.NewServer(&admin.Opts{
+		OcteliumC:  fakeC.OcteliumC,
+		IsEmbedded: true,
+	})
+
+	usr, err := tstuser.NewUserWithType(fakeC.OcteliumC, adminSrv, nil, nil, corev1.User_Spec_HUMAN, corev1.Session_Status_CLIENTLESS)
+	assert.Nil(t, err)
+
+	newSpace := func() *cordiumv1.Space {
+		ret, err := srv.CreateSpace(usr.Ctx(), &cordiumv1.Space{
+			Metadata: &metav1.Metadata{
+				Name: fmt.Sprintf("%s.cordium", utilrand.GetRandomStringCanonical(8)),
+			},
+			Spec: &cordiumv1.Space_Spec{},
+			Status: &cordiumv1.Space_Status{
+				Type: cordiumv1.Space_Status_ORGANIZATION,
+			},
+		})
+		assert.Nil(t, err, "%+v", err)
+		return ret
+	}
+
+	getCount := func(org *cordiumv1.Space) uint32 {
+		itmList, err := fakeC.OcteliumC.CordiumC().ListSecret(ctx,
+			ourscsrv.SetCountOnly(ourscsrv.FilterBySpace(org)))
+		assert.Nil(t, err, "%+v", err)
+		assert.LessOrEqual(t, len(itmList.Items), 1)
+		return itmList.GetListResponseMeta().GetTotalCount()
+	}
+
+	org := newSpace()
+	orgOther := newSpace()
+
+	assert.Equal(t, uint32(0), getCount(org))
+
+	n := 5
+	for range n {
+		_, err := srv.CreateSecret(usr.Ctx(), &cordiumv1.Secret{
+			Metadata: &metav1.Metadata{
+				Name: fmt.Sprintf("%s.%s", utilrand.GetRandomStringCanonical(8), org.Metadata.Name),
+			},
+			Spec:   &cordiumv1.Secret_Spec{},
+			Status: &cordiumv1.Secret_Status{},
+			Data: &cordiumv1.Secret_Data{
+				Type: &cordiumv1.Secret_Data_Value{
+					Value: utilrand.GetRandomString(200),
+				},
+			},
+		})
+		assert.Nil(t, err, "%+v", err)
+	}
+
+	assert.Equal(t, uint32(n), getCount(org))
+	assert.Equal(t, uint32(0), getCount(orgOther))
+}

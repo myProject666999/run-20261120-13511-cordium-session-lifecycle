@@ -1,0 +1,213 @@
+/*
+ * Copyright Octelium Labs, LLC. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package oproxy
+
+import (
+	"context"
+	"crypto/tls"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/octelium/octelium/client/common/authc"
+	"github.com/octelium/octelium/pkg/utils/ldflags"
+	"github.com/pkg/errors"
+	"go.uber.org/zap"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+)
+
+func (p *OcteliumProxy) getHTTPHandler(ctx context.Context) (http.Handler, error) {
+	chain := newMiddlewareChain()
+
+	chain = chain.Append(func(next http.Handler) (http.Handler, error) {
+		return newHeaderMiddleware(p, next)
+	})
+
+	handler, err := chain.Then(p)
+	if err != nil {
+		return nil, err
+	}
+
+	handler = http.AllowQuerySemicolons(handler)
+
+	handler = h2c.NewHandler(handler, &http2.Server{})
+
+	return handler, nil
+}
+
+func (s *OcteliumProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.proxy.ServeHTTP(w, r)
+}
+
+func (p *OcteliumProxy) getProxy() (http.Handler, error) {
+
+	roundTripper, err := p.getRoundTripper(p.opts.Domain)
+	if err != nil {
+		return nil, err
+	}
+
+	ret := &httputil.ReverseProxy{
+		BufferPool: newBufferPool(),
+		Transport:  roundTripper,
+		Director: func(outReq *http.Request) {
+
+			host := authc.GetAPIServerAddr(p.opts.Domain)
+			outReq.URL.Scheme = "https"
+			outReq.URL.Host = host
+			outReq.Host = host
+
+			outReq.URL.RawQuery = strings.ReplaceAll(outReq.URL.RawQuery, ";", "&")
+			outReq.RequestURI = ""
+
+			if _, ok := outReq.Header["User-Agent"]; !ok {
+				outReq.Header.Set("User-Agent", "octelium")
+			}
+
+			outReq.Proto = "HTTP/2"
+			outReq.ProtoMajor = 2
+			outReq.ProtoMinor = 0
+
+		},
+
+		FlushInterval: time.Duration(100 * time.Millisecond),
+
+		ErrorHandler: func(w http.ResponseWriter, request *http.Request, err error) {
+			statusCode := http.StatusInternalServerError
+			zap.S().Debugf("Handling response err: %+v", err)
+			switch {
+			case errors.Is(err, io.EOF):
+				statusCode = http.StatusBadGateway
+			case errors.Is(err, context.Canceled):
+				statusCode = 499
+			default:
+				var netErr net.Error
+				if errors.As(err, &netErr) {
+					if netErr.Timeout() {
+						statusCode = http.StatusGatewayTimeout
+					} else {
+						statusCode = http.StatusBadGateway
+					}
+				}
+			}
+
+			zap.S().Debugf("'%d %s' caused by: %v", statusCode, http.StatusText(statusCode), err)
+			w.WriteHeader(statusCode)
+			_, werr := w.Write([]byte(http.StatusText(statusCode)))
+			if werr != nil {
+				zap.S().Debugf("Error while writing status code: %+v", werr)
+			}
+		},
+	}
+
+	return ret, nil
+}
+
+const bufferPoolSize = 32 * 1024
+
+func newBufferPool() *bufferPool {
+	return &bufferPool{
+		pool: sync.Pool{
+			New: func() interface{} {
+				return make([]byte, bufferPoolSize)
+			},
+		},
+	}
+}
+
+type bufferPool struct {
+	pool sync.Pool
+}
+
+func (b *bufferPool) Get() []byte {
+	return b.pool.Get().([]byte)
+}
+
+func (b *bufferPool) Put(bytes []byte) {
+	b.pool.Put(bytes)
+}
+
+type roundTripper struct {
+	sniName string
+	rt      http.RoundTripper
+}
+
+func (p *OcteliumProxy) getRoundTripper(sniName string) (*roundTripper, error) {
+	ret := &roundTripper{
+		sniName: sniName,
+	}
+
+	tlsCfg := &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		MaxVersion:         tls.VersionTLS13,
+		ServerName:         sniName,
+		InsecureSkipVerify: ldflags.IsDev(),
+	}
+
+	rt, err := ret.getRoundTripperHTTP2(tlsCfg)
+	if err != nil {
+		return nil, err
+	}
+	ret.rt = rt
+
+	return ret, nil
+}
+
+func (r *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return r.rt.RoundTrip(req)
+}
+
+func (r *roundTripper) getRoundTripperHTTP2(tlsCfg *tls.Config) (http.RoundTripper, error) {
+	ret, err := r.getRoundTripperHTTP1(tlsCfg)
+	if err != nil {
+		return nil, err
+	}
+	_, err = http2.ConfigureTransports(ret)
+	if err != nil {
+		return nil, err
+	}
+
+	return ret, nil
+}
+
+func (r *roundTripper) getRoundTripperHTTP1(tlsCfg *tls.Config) (*http.Transport, error) {
+
+	ret := &http.Transport{
+		TLSClientConfig: tlsCfg,
+		Proxy:           http.ProxyFromEnvironment,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}
+
+			return dialer.DialContext(ctx, network, addr)
+		},
+
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ReadBufferSize:        64 * 1024,
+		WriteBufferSize:       64 * 1024,
+	}
+
+	return ret, nil
+}
